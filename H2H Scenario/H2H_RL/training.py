@@ -39,7 +39,7 @@ class TrainConfig:
     #max_grad_norm: float = 0.5
 
     max_epochs: int = 1000
-    eval_every: int = 1
+    eval_every: int = 100
 
     train_seed: int = 42
     eval_seed: int = 7
