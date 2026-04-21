@@ -668,7 +668,7 @@ def animate_simulation(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_testing_7.pt")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_result.pt")
     parser.add_argument("--n_rollouts", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save_dir", type=str, default="evaluation_outputs")
