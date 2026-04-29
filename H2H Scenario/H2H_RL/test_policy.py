@@ -239,6 +239,13 @@ def compute_rollout_metrics(
     avg_abs_y_j = float(np.mean(np.abs(x_j[:, 1])))
 
     deadlock = int(np.isnan(time_to_goal_i) and np.isnan(time_to_goal_j))
+    invalid_motion_metrics = (
+        infeasible_qp
+        or intervehicle_collision_i
+        or intervehicle_collision_j
+        or boundary_collision_i
+        or boundary_collision_j
+    )
 
     return {
         "i": {
@@ -263,42 +270,47 @@ def compute_rollout_metrics(
         },
         "deadlock": deadlock,
         "infeasible_qp": infeasible_qp,
+        "valid_motion_metrics": int(not invalid_motion_metrics),
         "episode_return": float(np.sum(hist["reward"])),
     }
 
 
 def average_rollout_metrics(all_metrics: List[Dict]) -> Dict:
     avg = {"i": {}, "j": {}}
+    valid_motion_metrics = [m for m in all_metrics if m.get("valid_motion_metrics", 1)]
+
+    def mean_valid(veh: str, key: str, nanmean: bool = False) -> float:
+        if not valid_motion_metrics:
+            return float("nan")
+        values = [m[veh][key] for m in valid_motion_metrics]
+        if nanmean:
+            finite_values = [v for v in values if not np.isnan(v)]
+            if not finite_values:
+                return float("nan")
+            return float(np.mean(finite_values))
+        return float(np.mean(values))
 
     for veh in ["i", "j"]:
-        avg[veh]["time_to_goal"] = float(
-            np.nanmean([m[veh]["time_to_goal"] for m in all_metrics])
-        )
-        avg[veh]["avg_abs_y"] = float(
-            np.mean([m[veh]["avg_abs_y"] for m in all_metrics])
-        )
-        avg[veh]["acc_effort"] = float(
-            np.mean([m[veh]["acc_effort"] for m in all_metrics])
-        )
-        avg[veh]["steer_rate_effort"] = float(
-            np.mean([m[veh]["steer_rate_effort"] for m in all_metrics])
-        )
+        avg[veh]["time_to_goal"] = mean_valid(veh, "time_to_goal", nanmean=True)
+        avg[veh]["avg_abs_y"] = mean_valid(veh, "avg_abs_y")
+        avg[veh]["acc_effort"] = mean_valid(veh, "acc_effort")
+        avg[veh]["steer_rate_effort"] = mean_valid(veh, "steer_rate_effort")
         avg[veh]["intervehicle_collision"] = float(
             np.mean([m[veh]["intervehicle_collision"] for m in all_metrics])
         )
         avg[veh]["boundary_collision"] = float(
             np.mean([m[veh]["boundary_collision"] for m in all_metrics])
         )
-        avg[veh]["min_intervehicle_clearance"] = float(
-            np.mean([m[veh]["min_intervehicle_clearance"] for m in all_metrics])
-        )
-        avg[veh]["min_boundary_clearance"] = float(
-            np.mean([m[veh]["min_boundary_clearance"] for m in all_metrics])
-        )
+        avg[veh]["min_intervehicle_clearance"] = mean_valid(veh, "min_intervehicle_clearance")
+        avg[veh]["min_boundary_clearance"] = mean_valid(veh, "min_boundary_clearance")
 
-    avg["deadlock_count"] = int(np.sum([m["deadlock"] for m in all_metrics]))
-    avg["deadlock_rate"] = float(np.mean([m["deadlock"] for m in all_metrics]))
+    avg["deadlock_rate"] = (
+        float(np.mean([m["deadlock"] for m in valid_motion_metrics]))
+        if valid_motion_metrics
+        else float("nan")
+    )
     avg["infeasible_qp_rate"] = float(np.mean([m["infeasible_qp"] for m in all_metrics]))
+    avg["valid_motion_rollouts"] = len(valid_motion_metrics)
     avg["avg_episode_return"] = float(np.mean([m["episode_return"] for m in all_metrics]))
 
     return avg
@@ -321,16 +333,16 @@ def show_average_metrics_table(avg_metrics, n_rollouts: int):
         "Boundary Collision Rate",
         "Min Inter-Vehicle Clearance [m]",
         "Min Boundary Clearance [m]",
-        "Deadlocks [count]",
         "Deadlock Rate",
         "Infeasible QP Rate",
+        "Valid Motion Rollouts",
         "Avg Episode Return",
     ]
 
-    deadlock_count_str = f"{avg_metrics['deadlock_count']}/{n_rollouts}"
-    deadlock_rate_str = f"{avg_metrics['deadlock_rate']:.3f}"
+    deadlock_rate_str = fmt_nan(avg_metrics["deadlock_rate"])
     infeasible_rate_str = f"{avg_metrics['infeasible_qp_rate']:.3f}"
-    avg_return_str = f"{avg_metrics['avg_episode_return']:.3f}"
+    valid_motion_rollouts_str = f"{avg_metrics['valid_motion_rollouts']}/{n_rollouts}"
+    avg_return_str = fmt_nan(avg_metrics["avg_episode_return"])
 
     table_data = [
         [fmt_nan(avg_metrics["i"]["time_to_goal"]), fmt_nan(avg_metrics["j"]["time_to_goal"])],
@@ -341,9 +353,9 @@ def show_average_metrics_table(avg_metrics, n_rollouts: int):
         [f"{avg_metrics['i']['boundary_collision']:.3f}", f"{avg_metrics['j']['boundary_collision']:.3f}"],
         [f"{avg_metrics['i']['min_intervehicle_clearance']:.3f}", f"{avg_metrics['j']['min_intervehicle_clearance']:.3f}"],
         [f"{avg_metrics['i']['min_boundary_clearance']:.3f}", f"{avg_metrics['j']['min_boundary_clearance']:.3f}"],
-        [deadlock_count_str, deadlock_count_str],
         [deadlock_rate_str, deadlock_rate_str],
         [infeasible_rate_str, infeasible_rate_str],
+        [valid_motion_rollouts_str, valid_motion_rollouts_str],
         [avg_return_str, avg_return_str],
     ]
 
@@ -668,7 +680,9 @@ def animate_simulation(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_result.pt")
+    #parser.add_argument("--checkpoint", type=str, default="checkpoints/best_testing_23.pt")
+    #parser.add_argument("--checkpoint", type=str, default="V0/best_1.pt")
+    parser.add_argument("--checkpoint", type=str, default="V1/best_3.pt")
     parser.add_argument("--n_rollouts", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--save_dir", type=str, default="evaluation_outputs")
