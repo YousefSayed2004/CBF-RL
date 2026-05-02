@@ -9,7 +9,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = PACKAGE_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -103,10 +104,10 @@ def run_policy_rollout(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_testing_6.pt")
-    parser.add_argument("--n_rollouts", type=int, default=100)
+    parser.add_argument("--checkpoint", type=str, default=str(PACKAGE_ROOT / "checkpoints" / "best_testing_6.pt"))
+    parser.add_argument("--n_rollouts", type=int, default=20)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--save_dir", type=str, default="evaluation_outputs")
+    parser.add_argument("--save_dir", type=str, default=str(PACKAGE_ROOT / "evaluation_outputs"))
     parser.add_argument("--make_video", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no_animation", action="store_true")
     args = parser.parse_args()
