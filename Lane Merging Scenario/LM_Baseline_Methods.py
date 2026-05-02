@@ -810,10 +810,14 @@ def run_single_rollout(
     qpws = {name: QPWeights() for name in names}
 
     lambda_constant_aggresive = 0.4
-    lambda_constant_normal = 0.15
+    lambda_constant_normal = 0.2
     lambda_constant_conservative = 0.1
 
-    clearance_gains = {"upper": 0.2 / 4, "mid": 0.4, "lower": 0.2 / 4}
+    aggresive_gain = 0.4
+    conservative_gain = 0.2 / 4
+
+
+    clearance_gains = {"upper": conservative_gain, "mid": aggresive_gain, "lower": conservative_gain}
     lambda_lower = {name: 0.1 for name in names}
     lambda_upper = {name: 0.4 for name in names}
 
@@ -827,18 +831,23 @@ def run_single_rollout(
     clearance_mid_lower = current_clearances["mid_lower"]
 
     cbfps = {}
+    def adaptive_clearance_for_vehicle(name: str) -> float:
+        return clearance_mid_upper if (name == "upper" or name == "mid") else min(clearance_mid_lower, clearance_upper_lower)
+        #return clearance_mid_lower if (name == "lower" or name == "mid") else min(clearance_mid_upper, clearance_upper_lower)
+        #return clearance_upper_lower if (name == "upper" or name == "lower") else min(clearance_mid_upper, clearance_mid_lower)
+
     if cbfp_schedule == "constant_same":
         for name in names:
-            cbfps[name] = CBFParams(lambda_cbf=0.2, cbf_slack_weight=5e7)
+            cbfps[name] = CBFParams(lambda_cbf=0.2, cbf_slack_weight=1e7)
     elif cbfp_schedule == "constant_different":
-        cbfps["upper"] = CBFParams(lambda_cbf=lambda_constant_normal, cbf_slack_weight=5e7)
-        cbfps["mid"] = CBFParams(lambda_cbf=lambda_constant_aggresive, cbf_slack_weight=5e7)
-        cbfps["lower"] = CBFParams(lambda_cbf=lambda_constant_conservative, cbf_slack_weight=5e7)
+        cbfps["upper"] = CBFParams(lambda_cbf=lambda_constant_aggresive, cbf_slack_weight=1e7)
+        cbfps["mid"] = CBFParams(lambda_cbf=lambda_constant_conservative, cbf_slack_weight=1e7)
+        cbfps["lower"] = CBFParams(lambda_cbf=lambda_constant_normal, cbf_slack_weight=1e7)
     elif cbfp_schedule == "adaptive":
         for name in names:
             cbfps[name] = CBFParams(
                 lambda_cbf=adaptive_lambda_from_clearance(
-                    clearance=clearance_mid_upper if (name == "upper" or name == "mid") else min(clearance_mid_lower, clearance_upper_lower),
+                    clearance=adaptive_clearance_for_vehicle(name),
                     clearance_gain=clearance_gains[name],
                     lambda_lower_bound=lambda_lower[name],
                     lambda_upper_bound=lambda_upper[name],
@@ -860,14 +869,27 @@ def run_single_rollout(
         hist[f"clearance_{pair_name}"] = [clearance]
 
     def print_step_details(t_now, pairwise_clearances, boundary_clearances):
+        def boundary_phase_label(name: str, boundary_side: str) -> str:
+            _, _, _, phase = active_boundary_frame_for_vehicle(
+                name,
+                front_circle_center(states[name], vps[name]),
+                geom,
+                boundary_side,
+            )
+            if phase.endswith("_angled"):
+                return "before_switch/angled"
+            return "after_switch/middle"
+
         msg = (
-           # f"t = {t_now:.1f} s | x_switch = {geom.x_switch:.3f} | "
-            #f"clr_ul = {pairwise_clearances['upper_lower']:.3f} | "
-            #f"clr_mu = {pairwise_clearances['mid_upper']:.3f} | "
-            #f"clr_ml = {pairwise_clearances['mid_lower']:.3f} | "
-            f"bclr_u = {boundary_clearances['upper']:.3f} | "
-            f"bclr_m = {boundary_clearances['mid']:.3f} | "
-            f"bclr_l = {boundary_clearances['lower']:.3f} | "
+            f"t = {t_now:.1f} s | "
+            #f"upper_left = {boundary_phase_label('upper', 'left')} | "
+            #f"lower_right = {boundary_phase_label('lower', 'right')} | "
+            f"clr_ul = {pairwise_clearances['upper_lower']:.3f} | "
+            f"clr_mu = {pairwise_clearances['mid_upper']:.3f} | "
+            f"clr_ml = {pairwise_clearances['mid_lower']:.3f} | "
+            #f"bclr_u = {boundary_clearances['upper']:.3f} | "
+            #f"bclr_m = {boundary_clearances['mid']:.3f} | "
+            #f"bclr_l = {boundary_clearances['lower']:.3f} | "
             f"lam_u = {cbfps['upper'].lambda_cbf:.3f} | "
             f"lam_m = {cbfps['mid'].lambda_cbf:.3f} | "
             f"lam_l = {cbfps['lower'].lambda_cbf:.3f}"
@@ -897,12 +919,8 @@ def run_single_rollout(
 
         if cbfp_schedule == "adaptive":
             for name in names:
-                if name == "upper" or name == "mid":
-                    clearance = clearance_mid_upper   
-                else:
-                    clearance = min(clearance_mid_lower, clearance_upper_lower)
                 cbfps[name].lambda_cbf = adaptive_lambda_from_clearance(
-                    clearance,
+                    adaptive_clearance_for_vehicle(name),
                     clearance_gain=clearance_gains[name],
                     lambda_lower_bound=lambda_lower[name],
                     lambda_upper_bound=lambda_upper[name],
@@ -1431,6 +1449,7 @@ def animate_simulation(
 
     x_hist = {name: hist[f"x_{name}"] for name in names}
     goal_hist = {name: hist[f"goal_{name}"] for name in names}
+    lambda_hist = {name: hist.get(f"lambda_{name}") for name in names}
     t = hist["t"]
 
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -1516,6 +1535,23 @@ def animate_simulation(
         goal_scatters[name] = ax.scatter([], [], marker="x", s=70, color=colors[name])
 
     time_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, va="top")
+    lambda_texts = {
+        "upper": ax.text(
+            0.18, 0.98, "", transform=ax.transAxes, va="top",
+            color=colors["upper"],
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        ),
+        "mid": ax.text(
+            0.43, 0.98, "", transform=ax.transAxes, va="top",
+            color=colors["mid"],
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        ),
+        "lower": ax.text(
+            0.65, 0.98, "", transform=ax.transAxes, va="top",
+            color=colors["lower"],
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        ),
+    }
     ax.legend(loc="upper right")
 
     def set_heading_line(line_obj, state, length=1.8):
@@ -1549,6 +1585,10 @@ def animate_simulation(
 
         time_text.set_text(f"t = {t[0]:.1f} s")
         artists.append(time_text)
+        for name in names:
+            if lambda_hist[name] is not None and len(lambda_hist[name]) > 0:
+                lambda_texts[name].set_text(f"lambda_{name} = {lambda_hist[name][0]:.3f}")
+            artists.append(lambda_texts[name])
         return artists
 
     def update(frame):
@@ -1581,6 +1621,11 @@ def animate_simulation(
 
         time_text.set_text(f"t = {t[frame]:.1f} s")
         artists.append(time_text)
+        for name in names:
+            if lambda_hist[name] is not None and len(lambda_hist[name]) > 0:
+                lambda_idx = min(frame, len(lambda_hist[name]) - 1)
+                lambda_texts[name].set_text(f"lambda_{name} = {lambda_hist[name][lambda_idx]:.3f}")
+            artists.append(lambda_texts[name])
         return artists
 
     ani = animation.FuncAnimation(
