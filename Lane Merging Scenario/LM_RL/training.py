@@ -14,7 +14,8 @@ from matplotlib import pyplot as plt
 from torch.distributions import Normal
 from torch.utils.data import DataLoader, IterableDataset
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = PACKAGE_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -42,7 +43,7 @@ class TrainConfig:
     train_seed: int = 42
     eval_seed: int = 7
     eval_rollouts: int = 10
-    project_root: str = "."
+    project_root: str = str(PACKAGE_ROOT)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -142,7 +143,7 @@ class PPOTrainer:
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=config.policy_lr)
         self.value_optimizer = torch.optim.Adam(self.value_net.parameters(), lr=config.value_lr)
 
-        self.project_root = config.project_root
+        self.project_root = os.fspath(Path(config.project_root).resolve())
         self.checkpoint_dir = os.path.join(self.project_root, "checkpoints")
         self.log_dir = os.path.join(self.project_root, "logs")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -431,7 +432,7 @@ class PPOTrainer:
 
 
 def main():
-    cfg = TrainConfig(project_root=".")
+    cfg = TrainConfig()
     trainer = PPOTrainer(cfg)
     trainer.train()
 
