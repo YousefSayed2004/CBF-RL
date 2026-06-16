@@ -165,11 +165,11 @@ class TrainConfig:
     samples_per_epoch: int = 128
     epoch_repeat: int = 8
     batch_size: int = 128
-    policy_lr: float = 3e-5
-    value_lr: float = 3e-4
+    policy_lr: float = 1e-4
+    value_lr: float = 1e-3
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_epsilon: float = 0.1
+    clip_epsilon: float = 0.2
     entropy_coef: float = 0.005
     max_epochs: int = 4000
     eval_every: int = 10
