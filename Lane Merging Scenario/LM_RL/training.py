@@ -20,14 +20,26 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 try:
-    from .env import NAMES, ThreeVehicleLambdaEnv
+    from .env import (
+        NAMES,
+        DecentralizedLaneMergingEnv,
+        average_rollout_metrics,
+        build_fixed_initial_states,
+        run_policy_rollout,
+    )
 except ImportError:
-    from env import NAMES, ThreeVehicleLambdaEnv
+    from env import (
+        NAMES,
+        DecentralizedLaneMergingEnv,
+        average_rollout_metrics,
+        build_fixed_initial_states,
+        run_policy_rollout,
+    )
 
 
 @dataclass
 class TrainConfig:
-    hidden_size: int = 128
+    hidden_size: int = 256
     num_envs: int = 8
     samples_per_epoch: int = 128
     epoch_repeat: int = 8
@@ -38,8 +50,8 @@ class TrainConfig:
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     entropy_coef: float = 0.005
-    max_epochs: int = 200
-    eval_every: int = 20
+    max_epochs: int = 500
+    eval_every: int = 10
     train_seed: int = 42
     eval_seed: int = 7
     eval_rollouts: int = 10
@@ -64,7 +76,7 @@ class GradientPolicy(nn.Module):
             nn.ReLU(),
         )
         self.loc = nn.Linear(hidden_size, out_dims)
-        self.log_std = nn.Parameter(torch.zeros(out_dims))
+        self.log_std = nn.Parameter(torch.full((out_dims,), -1.0))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.features(x)
@@ -133,10 +145,11 @@ class PPOTrainer:
         torch.manual_seed(config.train_seed)
         np.random.seed(config.train_seed)
 
-        self.envs = [ThreeVehicleLambdaEnv(seed=config.train_seed + i) for i in range(config.num_envs)]
+        self.envs = [DecentralizedLaneMergingEnv(seed=config.train_seed + i) for i in range(config.num_envs)]
         self.obs_list = [env.reset() for env in self.envs]
         self.obs_dim = self.envs[0].observation_dim
         self.action_dim = self.envs[0].action_dim
+        self.n_agents = len(NAMES)
 
         self.policy = GradientPolicy(self.obs_dim, config.hidden_size, self.action_dim).to(self.device)
         self.value_net = ValueNet(self.obs_dim, config.hidden_size).to(self.device)
@@ -155,9 +168,9 @@ class PPOTrainer:
         self.interrupt_ckpt = os.path.join(self.checkpoint_dir, "interrupt.pt")
         self.csv_log = os.path.join(self.log_dir, "training_history.csv")
         self.best_score = -float("inf")
+        self.worst_score = float("inf")
         self.start_epoch = 1
         self.stop_requested = False
-        self.best_testing_count = 0
 
         self._register_interrupt_handler()
         self._try_resume()
@@ -177,9 +190,9 @@ class PPOTrainer:
             self.value_optimizer.load_state_dict(checkpoint["value_optimizer_state_dict"])
             self.start_epoch = checkpoint["epoch"] + 1
             self.best_score = checkpoint["best_score"]
+            self.worst_score = checkpoint.get("worst_score", self.worst_score)
             self.plot.average_reward = checkpoint.get("average_reward", [])
             self.running_returns = checkpoint.get("running_returns", self.running_returns)
-            self.best_testing_count = checkpoint.get("best_testing_count", 0)
             print(f"Resuming training from epoch {self.start_epoch}")
 
     def save_checkpoint(self, path: str, epoch: int):
@@ -190,11 +203,19 @@ class PPOTrainer:
             "policy_optimizer_state_dict": self.policy_optimizer.state_dict(),
             "value_optimizer_state_dict": self.value_optimizer.state_dict(),
             "best_score": self.best_score,
+            "worst_score": self.worst_score,
             "config": self.cfg.__dict__,
             "average_reward": self.plot.average_reward,
             "running_returns": self.running_returns,
-            "best_testing_count": self.best_testing_count,
         }, path)
+
+    def zero_collision_checkpoint_path(self) -> str:
+        index = 1
+        while True:
+            path = os.path.join(self.checkpoint_dir, f"zero_coll_{index}.pt")
+            if not os.path.exists(path):
+                return path
+            index += 1
 
     def collect_rollouts(self):
         batch_obs, batch_actions, batch_log_probs = [], [], []
@@ -203,7 +224,8 @@ class PPOTrainer:
 
         for _ in range(self.cfg.samples_per_epoch):
             obs_np = np.stack(self.obs_list, axis=0)
-            obs_t = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
+            obs_flat_np = obs_np.reshape(-1, self.obs_dim)
+            obs_t = torch.tensor(obs_flat_np, dtype=torch.float32, device=self.device)
 
             with torch.no_grad():
                 loc, scale = self.policy(obs_t)
@@ -212,7 +234,9 @@ class PPOTrainer:
                 log_probs_t = dist.log_prob(actions_t).sum(dim=-1)
                 values_t = self.value_net(obs_t)
 
-            actions_np = actions_t.cpu().numpy()
+            actions_np = actions_t.cpu().numpy().reshape(self.cfg.num_envs, self.n_agents, self.action_dim)
+            log_probs_np = log_probs_t.cpu().numpy().reshape(self.cfg.num_envs, self.n_agents)
+            values_np = values_t.cpu().numpy().reshape(self.cfg.num_envs, self.n_agents)
             next_obs_list, rewards, dones = [], [], []
 
             for env_idx, env in enumerate(self.envs):
@@ -229,17 +253,22 @@ class PPOTrainer:
                 dones.append(float(done))
 
             next_obs_np = np.stack(next_obs_list, axis=0)
-            next_obs_t = torch.tensor(next_obs_np, dtype=torch.float32, device=self.device)
+            next_obs_flat_np = next_obs_np.reshape(-1, self.obs_dim)
+            next_obs_t = torch.tensor(next_obs_flat_np, dtype=torch.float32, device=self.device)
             with torch.no_grad():
-                next_values_t = self.value_net(next_obs_t)
+                next_values_np = self.value_net(next_obs_t).cpu().numpy().reshape(self.cfg.num_envs, self.n_agents)
 
             batch_obs.append(obs_np)
             batch_actions.append(actions_np)
-            batch_log_probs.append(log_probs_t.cpu().numpy())
-            batch_rewards.append(np.array(rewards, dtype=np.float32))
-            batch_dones.append(np.array(dones, dtype=np.float32))
-            batch_values.append(values_t.cpu().numpy())
-            batch_next_values.append(next_values_t.cpu().numpy())
+            batch_log_probs.append(log_probs_np)
+            batch_rewards.append(
+                np.repeat(np.array(rewards, dtype=np.float32)[:, None], self.n_agents, axis=1)
+            )
+            batch_dones.append(
+                np.repeat(np.array(dones, dtype=np.float32)[:, None], self.n_agents, axis=1)
+            )
+            batch_values.append(values_np)
+            batch_next_values.append(next_values_np)
             self.obs_list = next_obs_list
 
         obs_arr = np.asarray(batch_obs, dtype=np.float32)
@@ -280,14 +309,18 @@ class PPOTrainer:
     def compute_gae_all_envs(self, rewards_arr, dones_arr, values_arr, next_values_arr):
         advantages_all, returns_all = [], []
         for env_idx in range(self.cfg.num_envs):
-            adv, ret = self.compute_gae(
-                rewards_arr[:, env_idx],
-                dones_arr[:, env_idx],
-                values_arr[:, env_idx],
-                next_values_arr[:, env_idx],
-            )
-            advantages_all.append(adv)
-            returns_all.append(ret)
+            env_advantages, env_returns = [], []
+            for agent_idx in range(self.n_agents):
+                adv, ret = self.compute_gae(
+                    rewards_arr[:, env_idx, agent_idx],
+                    dones_arr[:, env_idx, agent_idx],
+                    values_arr[:, env_idx, agent_idx],
+                    next_values_arr[:, env_idx, agent_idx],
+                )
+                env_advantages.append(adv)
+                env_returns.append(ret)
+            advantages_all.append(np.stack(env_advantages, axis=1))
+            returns_all.append(np.stack(env_returns, axis=1))
         return np.stack(advantages_all, axis=1).astype(np.float32), np.stack(returns_all, axis=1).astype(np.float32)
 
     def policy_loss(self, obs, actions, old_log_probs, advantages):
@@ -305,27 +338,55 @@ class PPOTrainer:
         return 0.5 * ((values_pred - returns) ** 2).mean()
 
     def evaluate(self) -> Dict:
-        from env import average_rollout_metrics, build_fixed_initial_states, run_policy_rollout
-
-        eval_env = ThreeVehicleLambdaEnv(seed=self.cfg.eval_seed)
+        eval_env = DecentralizedLaneMergingEnv(seed=self.cfg.eval_seed)
         initial_states = build_fixed_initial_states(self.cfg.eval_rollouts, self.cfg.eval_seed)
         all_metrics = []
 
         def action_fn(obs_np: np.ndarray) -> np.ndarray:
-            obs_t = torch.tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+            obs_t = torch.tensor(obs_np.reshape(-1, self.obs_dim), dtype=torch.float32, device=self.device)
             with torch.no_grad():
                 loc, _ = self.policy(obs_t)
-            return loc.squeeze(0).cpu().numpy()
+            return loc.cpu().numpy()
 
         for init_states in initial_states:
             _, metrics = run_policy_rollout(eval_env, action_fn=action_fn, initial_states=init_states)
             all_metrics.append(metrics)
-        return average_rollout_metrics(all_metrics)
+
+        eval_metrics = average_rollout_metrics(all_metrics)
+        episode_returns = [
+            m["episode_return"]
+            for m in all_metrics
+            if "episode_return" in m and not np.isnan(m["episode_return"])
+        ]
+        eval_metrics["avg_episode_return"] = (
+            float(np.mean(episode_returns))
+            if episode_returns
+            else float("nan")
+        )
+        return eval_metrics
 
     def append_csv_row(self, row: Dict):
         file_exists = os.path.exists(self.csv_log)
+        fieldnames = list(row.keys())
+        if file_exists:
+            with open(self.csv_log, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_fieldnames = reader.fieldnames or []
+                existing_rows = list(reader)
+            if existing_fieldnames != fieldnames:
+                merged_fieldnames = list(existing_fieldnames)
+                for field in fieldnames:
+                    if field not in merged_fieldnames:
+                        merged_fieldnames.append(field)
+                with open(self.csv_log, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=merged_fieldnames)
+                    writer.writeheader()
+                    for existing_row in existing_rows:
+                        writer.writerow(existing_row)
+                fieldnames = merged_fieldnames
+
         with open(self.csv_log, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
@@ -394,35 +455,36 @@ class PPOTrainer:
                 csv_row = {
                     "epoch": epoch,
                     "avg_reward": round(eval_metrics["avg_episode_return"], 6),
-                    "collision_rate": round(max(eval_metrics[name]["intervehicle_collision"] for name in NAMES), 6),
-                    "boundary_collision_rate": round(sum(eval_metrics[name]["boundary_collision"] for name in NAMES), 6),
-                    "infeasible_qp_rate": round(eval_metrics["infeasible_qp_rate"], 6),
-                    "deadlock_rate": round(eval_metrics["deadlock_rate"], 6),
+                    "valid_rollouts": int(eval_metrics["valid_motion_rollouts"]),
+                    "collision_count": int(eval_metrics["intervehicle_collision_count"]),
+                    "boundary_collision_count": int(eval_metrics["boundary_collision_count"]),
+                    "infeasible_qp_count": int(eval_metrics["infeasible_qp_count"]),
+                    "deadlock_count": int(eval_metrics["deadlock_count"]),
                 }
                 for name in NAMES:
                     t_goal = eval_metrics[name]["time_to_goal"]
                     csv_row[f"avg_time_to_goal_{name}"] = round(t_goal, 6) if not math.isnan(t_goal) else float("nan")
-                    csv_row[f"avg_abs_y_{name}"] = round(eval_metrics[name]["avg_abs_y"], 6)
-                    csv_row[f"min_intervehicle_clearance_{name}"] = round(eval_metrics[name]["min_intervehicle_clearance"], 6)
                 self.append_csv_row(csv_row)
 
+                eval_score = float(eval_metrics["avg_episode_return"])
+                if eval_score > self.best_score:
+                    self.best_score = eval_score
+                    self.save_checkpoint(self.best_ckpt, epoch)
+                    print(f"  Saved new best evaluated checkpoint ({eval_score:.6f}) -> {self.best_ckpt}")
+                if eval_score < self.worst_score:
+                    self.worst_score = eval_score
+                    self.save_checkpoint(self.worst_ckpt, epoch)
+                    print(f"  Saved new worst evaluated checkpoint ({eval_score:.6f}) -> {self.worst_ckpt}")
+
                 if (
-                    all(eval_metrics[name]["intervehicle_collision"] == 0.0 for name in NAMES)
-                    and all(eval_metrics[name]["boundary_collision"] == 0.0 for name in NAMES)
-                    and eval_metrics["infeasible_qp_rate"] == 0.0
+                    eval_metrics["intervehicle_collision_count"] == 0
+                    and eval_metrics["boundary_collision_count"] == 0
                 ):
-                    self.best_testing_count += 1
-                    path = os.path.join(self.checkpoint_dir, f"best_testing_{self.best_testing_count}.pt")
-                    self.save_checkpoint(path, epoch)
-                    print(f"  Saved zero-collision test checkpoint -> {path}")
+                    zero_coll_ckpt = self.zero_collision_checkpoint_path()
+                    self.save_checkpoint(zero_coll_ckpt, epoch)
+                    print(f"  Saved zero-collision checkpoint -> {zero_coll_ckpt}")
 
             self.save_checkpoint(self.latest_ckpt, epoch)
-            if self.plot.average_reward[-1] == max(self.plot.average_reward):
-                self.save_checkpoint(self.best_ckpt, epoch)
-                print(f"  Saved new best checkpoint -> {self.best_ckpt}")
-            if self.plot.average_reward[-1] == min(self.plot.average_reward):
-                self.save_checkpoint(self.worst_ckpt, epoch)
-                print(f"  Saved new worst checkpoint -> {self.worst_ckpt}")
 
             if self.stop_requested:
                 self.save_checkpoint(self.interrupt_ckpt, epoch)
