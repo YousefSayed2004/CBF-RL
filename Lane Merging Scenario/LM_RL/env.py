@@ -17,14 +17,13 @@ from LM_Baseline_Methods import (
     RolloutConfig,
     SimParams,
     VehicleParams,
-    avg_abs_y_for_metrics,
+    average_rollout_metrics,
     build_random_initial_states,
     circle_approximation,
-    compute_time_to_goal_x,
+    compute_rollout_metrics,
     front_circle_center,
     lookahead_goal_from_track_point,
     min_boundary_clearance,
-    min_pair_clearance,
     nominal_control,
     pairwise_vehicle_clearances,
     sample_initial_point_on_lane,
@@ -56,11 +55,9 @@ class RewardConfig:
     collision_penalty: float = -100.0 / 100
     infeasible_qp_penalty: float = -150.0 / 100
     boundary_collision_penalty: float = -70.0 / 100
-    early_collision_penalty: float = -350.0 / 100
     progress_weight: float = 8.0 / 100
     deviation_weight: float = 0.15 / 100
     survival_bonus: float = 0.5 / 100
-    high_speed_reward_weight: float = 0.025
     goal_x: float = 5.0
 
 
@@ -344,11 +341,6 @@ class ThreeVehicleLambdaEnv:
         deviation_penalty = self.reward_cfg.deviation_weight * sum(lateral_devs.values())
         reward = float(progress_reward - deviation_penalty + self.reward_cfg.survival_bonus)
 
-        #if min_inter_clear >= 0.5:
-         #   reward += self.reward_cfg.survival_bonus
-        #if min(moved.values()) >= 7.5 and min_inter_clear <= self.episode_min_intervehicle_clearance:
-         #   accels = [abs(self.u_prev[name][0]) for name in NAMES]
-          #  reward += (max(accels) - min(accels)) * self.reward_cfg.high_speed_reward_weight
 
         collision = min_inter_clear < -1e-3
         boundary_collision = min(bound_clear.values()) < -1e-3
@@ -356,20 +348,11 @@ class ThreeVehicleLambdaEnv:
         event = "running"
 
         if collision:
-            reward = float(self.reward_cfg.collision_penalty + 0.5 * self.reward_cfg.collision_penalty * max(self.lambdas.values()))
-            #if min(moved.values()) <= 6.5:
-             #   reward *= 2.5
+            reward = float(self.reward_cfg.collision_penalty)
             done = True
             event = "collision"
         elif boundary_collision:
-            #if min(moved.values()) <= 6.5:
-             #   reward = float(self.reward_cfg.early_collision_penalty)
-              #  event = "early_boundary_collision"
-           # else:
-            reward = float(
-                self.reward_cfg.boundary_collision_penalty
-                + 0.5 * self.reward_cfg.boundary_collision_penalty * max(self.lambdas.values())
-            )
+            reward = float(self.reward_cfg.boundary_collision_penalty)
             event = "boundary_collision"
             done = True
         elif self.step_count >= self.sim.steps:
@@ -410,6 +393,95 @@ class ThreeVehicleLambdaEnv:
             info[f"goal_{name}"] = goals[name].copy()
             info[f"progress_{name}"] = progress[name]
         return info
+
+
+def pair_key_for_names(name_a: str, name_b: str) -> str:
+    pair_names = {name_a, name_b}
+    if pair_names == {"upper", "lower"}:
+        return "upper_lower"
+    if pair_names == {"mid", "upper"}:
+        return "mid_upper"
+    return "mid_lower"
+
+
+class DecentralizedLaneMergingEnv(ThreeVehicleLambdaEnv):
+    """Normalized nearest-first decentralized observation, matching the RI D5 structure without decision IDs."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.geom.lookahead_dist = 8.0
+        self.clfps = {
+            name: CLFParams(
+                w_v=1.0,
+                w_delta=15.0,
+                desired_speed=5.0,
+                nominal_speed_gain=1.0,
+                nominal_heading_gain=1.0,
+                nominal_steer_rate_gain=5.0,
+                clf_rate=10.0,
+                clf_slack_weight=1.0,
+            )
+            for name in NAMES
+        }
+        self.qpws = {name: QPWeights(u_weight=np.diag([1.0, 15.0])) for name in NAMES}
+        self.observation_dim = 18
+        self.action_dim = 1
+        self.position_obs_scale = max(abs(float(self.init_cfg.s0)), abs(float(self.reward_cfg.goal_x)), 1e-6)
+        self.speed_obs_scale = max(float(self.clfps[NAMES[0]].desired_speed), 1e-6)
+        first_vp = self.vps[NAMES[0]]
+        self.accel_obs_scale = max(abs(first_vp.max_accel), abs(first_vp.min_accel), 1e-6)
+
+    def _get_obs(self) -> np.ndarray:
+        pair_clear = self._pairwise_clearances()
+        bound_clear = self._boundary_clearances()
+        goals = self._goal_points()
+        positions = {name: self.states[name][:2].copy() for name in NAMES}
+        velocities = {
+            name: self.states[name][3] * np.array([
+                np.cos(self.states[name][2]),
+                np.sin(self.states[name][2]),
+            ], dtype=float)
+            for name in NAMES
+        }
+        local_obs = []
+
+        for name in NAMES:
+            state = self.states[name]
+            p = positions[name]
+            goal = goals[name]
+            psi_norm = ((state[2] + np.pi) % (2.0 * np.pi) - np.pi) / np.pi
+            heading = np.array([np.cos(state[2]), np.sin(state[2])], dtype=float)
+            left = np.array([-np.sin(state[2]), np.cos(state[2])], dtype=float)
+
+            obs = [
+                p[0] / self.position_obs_scale,
+                p[1] / self.position_obs_scale,
+                psi_norm,
+                state[3] / self.speed_obs_scale,
+                self.u_prev[name][0] / self.accel_obs_scale,
+                bound_clear[name] / self.position_obs_scale,
+                goal[0] / self.position_obs_scale,
+                goal[1] / self.position_obs_scale,
+            ]
+
+            other_names = sorted(
+                [other for other in NAMES if other != name],
+                key=lambda other: pair_clear[pair_key_for_names(name, other)],
+            )
+            for other in other_names:
+                rel = positions[other] - p
+                rel_v = velocities[other] - velocities[name]
+                obs.extend([
+                    float(rel @ heading) / self.position_obs_scale,
+                    float(rel @ left) / self.position_obs_scale,
+                    float(rel_v @ heading) / self.speed_obs_scale,
+                    float(rel_v @ left) / self.speed_obs_scale,
+                    pair_clear[pair_key_for_names(name, other)] / self.position_obs_scale,
+                ])
+
+            local_obs.append(obs)
+
+        return np.array(local_obs, dtype=np.float32)
 
 
 def build_fixed_initial_states(
@@ -479,105 +551,3 @@ def run_policy_rollout(
 
     metrics = compute_rollout_metrics(hist, env.vps, env.geom, env.circle_offsets, env.circle_radius, env.reward_cfg.goal_x)
     return hist, metrics
-
-
-def compute_rollout_metrics(
-    hist: Dict,
-    vps: Dict[str, VehicleParams],
-    geom: MergeGeometry,
-    circle_offsets: np.ndarray,
-    circle_radius: float,
-    goal_x: float = 5.0,
-) -> Dict:
-    t = hist["t"]
-    dt = t[1] - t[0] if len(t) > 1 else 0.0
-    metrics = {name: {} for name in NAMES}
-    infeasible_qp = int(any(ev == "infeasible_qp" for ev in hist["events"]))
-
-    for name in NAMES:
-        x_hist = hist[f"x_{name}"]
-        u_hist = hist[f"u_{name}"]
-        time_to_goal = compute_time_to_goal_x(x_hist[:, 0], t, x_goal=goal_x)
-        metrics[name]["time_to_goal"] = time_to_goal
-        metrics[name]["goal_reached"] = int(not np.isnan(time_to_goal))
-        metrics[name]["avg_abs_y"] = avg_abs_y_for_metrics(name, x_hist, geom)
-        metrics[name]["acc_effort"] = float(np.sum(np.abs(u_hist[:, 0])) * dt) if len(u_hist) else 0.0
-        metrics[name]["steer_rate_effort"] = float(np.sum(np.abs(u_hist[:, 1])) * dt) if len(u_hist) else 0.0
-        metrics[name]["boundary_collision"] = 0
-        metrics[name]["min_boundary_clearance"] = np.inf
-        metrics[name]["intervehicle_collision"] = 0
-        metrics[name]["min_intervehicle_clearance"] = np.inf
-
-    for k in range(len(t)):
-        states_now = {name: hist[f"x_{name}"][k] for name in NAMES}
-        pair_clear = pairwise_vehicle_clearances(states_now, vps, circle_offsets, circle_radius)
-        per_vehicle_clear = {
-            "upper": min(pair_clear["upper_lower"], pair_clear["mid_upper"]),
-            "mid": min(pair_clear["mid_upper"], pair_clear["mid_lower"]),
-            "lower": min(pair_clear["upper_lower"], pair_clear["mid_lower"]),
-        }
-        for name in NAMES:
-            b_clear = min_boundary_clearance(states_now[name], name, geom, vps[name], circle_offsets, circle_radius)
-            metrics[name]["min_boundary_clearance"] = min(metrics[name]["min_boundary_clearance"], b_clear)
-            metrics[name]["min_intervehicle_clearance"] = min(metrics[name]["min_intervehicle_clearance"], per_vehicle_clear[name])
-            if b_clear < 0.0:
-                metrics[name]["boundary_collision"] = 1
-            if per_vehicle_clear[name] < 0.0:
-                metrics[name]["intervehicle_collision"] = 1
-
-    deadlock = int(all(np.isnan(metrics[name]["time_to_goal"]) for name in NAMES))
-    invalid_motion_metrics = infeasible_qp or any(
-        metrics[name]["intervehicle_collision"] or metrics[name]["boundary_collision"]
-        for name in NAMES
-    )
-
-    result = {name: metrics[name] for name in NAMES}
-    result.update({
-        "deadlock": deadlock,
-        "infeasible_qp": infeasible_qp,
-        "valid_motion_metrics": int(not invalid_motion_metrics),
-        "episode_return": float(np.sum(hist["reward"])),
-    })
-    return result
-
-
-def average_rollout_metrics(all_metrics: List[Dict]) -> Dict:
-    avg = {name: {} for name in NAMES}
-    valid_motion_metrics = [m for m in all_metrics if m.get("valid_motion_metrics", 1)]
-
-    def mean_valid(name: str, key: str, nanmean: bool = False) -> float:
-        if not valid_motion_metrics:
-            return float("nan")
-        values = [m[name][key] for m in valid_motion_metrics]
-        if nanmean:
-            values = [v for v in values if not np.isnan(v)]
-            if not values:
-                return float("nan")
-        return float(np.mean(values))
-
-    for name in NAMES:
-        avg[name]["time_to_goal"] = mean_valid(name, "time_to_goal", nanmean=True)
-        avg[name]["goal_reached_count"] = int(np.sum([m[name]["goal_reached"] for m in valid_motion_metrics]))
-        avg[name]["avg_abs_y"] = mean_valid(name, "avg_abs_y")
-        avg[name]["acc_effort"] = mean_valid(name, "acc_effort")
-        avg[name]["steer_rate_effort"] = mean_valid(name, "steer_rate_effort")
-        avg[name]["intervehicle_collision"] = float(np.mean([m[name]["intervehicle_collision"] for m in all_metrics]))
-        avg[name]["boundary_collision"] = float(np.mean([m[name]["boundary_collision"] for m in all_metrics]))
-        avg[name]["min_intervehicle_clearance"] = mean_valid(name, "min_intervehicle_clearance")
-        avg[name]["min_boundary_clearance"] = mean_valid(name, "min_boundary_clearance")
-
-    avg["deadlock_rate"] = (
-        float(np.mean([m["deadlock"] for m in valid_motion_metrics]))
-        if valid_motion_metrics
-        else float("nan")
-    )
-    avg["deadlock_count"] = int(np.sum([m["deadlock"] for m in all_metrics]))
-    avg["infeasible_qp_count"] = int(np.sum([m["infeasible_qp"] for m in all_metrics]))
-    avg["infeasible_qp_rate"] = float(np.mean([m["infeasible_qp"] for m in all_metrics]))
-    avg["valid_motion_rollouts"] = len(valid_motion_metrics)
-    avg["avg_episode_return"] = (
-        float(np.mean([m["episode_return"] for m in valid_motion_metrics]))
-        if valid_motion_metrics
-        else float("nan")
-    )
-    return avg
