@@ -65,7 +65,7 @@ class VehicleParams:
     width: float = 2.0
     wheelbase: float = 2.5
     max_speed: float = 10.0
-    min_speed: float = -2.0
+    min_speed: float = -10.0
     max_accel: float = 5.0
     min_accel: float = -5.0
     max_steer: float = 1.0
@@ -76,13 +76,13 @@ class VehicleParams:
 
 @dataclass
 class CLFParams:
-    w_v: float = 0.5
+    w_v: float = 1.0
     w_delta: float = 15.0
     desired_speed: float = 5.0
     nominal_speed_gain: float = 1.0
     nominal_heading_gain: float = 1.0
     nominal_steer_rate_gain: float = 5.0
-    clf_rate: float = 1.0
+    clf_rate: float = 10.0
     clf_slack_weight: float = 1.0
 
 
@@ -95,7 +95,12 @@ class CBFParams:
 
 @dataclass
 class QPWeights:
-    u_weight: np.ndarray = field(default_factory=lambda: np.diag([0.5, 50.0]))
+    u_weight: np.ndarray = field(default_factory=lambda: np.diag([1.0, 15.0]))
+    eta_weight: float = 1e7
+    eta_min: float = 0.0
+    eta_max: float = 1.0
+    # Set this to True if you want the aTTCBF baseline to use CBF slack again.
+    attcbf_use_cbf_slack: bool = True
 
 
 @dataclass
@@ -114,7 +119,7 @@ class SimParams:
 
 @dataclass
 class RolloutConfig:
-    n_rollouts: int = 10
+    n_rollouts: int = 20
     y_min: float = -0.25
     y_max: float = 0.25
     psi_min_deg: float = -10.0
@@ -130,7 +135,7 @@ class MergeGeometry:
     theta_upper_deg: float = -30.0
     theta_lower_deg: float = 30.0
     merge_point: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0], dtype=float))
-    lookahead_dist: float = 5.0
+    lookahead_dist: float = 8.0
     angled_lookahead_lateral_offset: float = -0.75
     entry_length: float = 30.0
 
@@ -522,6 +527,7 @@ def solve_vehicle_qp(
     circle_offsets: np.ndarray,
     circle_radius: float,
     goal_point: np.ndarray,
+    use_attcbf: bool = False,
 ) -> Tuple[np.ndarray, Dict]:
     u_nom = nominal_control(ego_state, clfp, ego_vp, goal_point)
 
@@ -532,6 +538,8 @@ def solve_vehicle_qp(
     u = cp.Variable(2)
     s_cbf = cp.Variable(n_cbf, nonneg=True)
     s_clf = cp.Variable(1, nonneg=True)
+    eta = cp.Variable() if use_attcbf else None
+    use_cbf_slack = (not use_attcbf) or qpw.attcbf_use_cbf_slack
 
     constraints = []
     constraints += [
@@ -548,13 +556,22 @@ def solve_vehicle_qp(
         ego_state[3] + dt * u[0] >= ego_vp.min_speed,
         ego_state[3] + dt * u[0] <= ego_vp.max_speed,
     ]
+    if use_attcbf:
+        constraints += [
+            eta >= qpw.eta_min,
+            eta <= qpw.eta_max,
+        ]
 
     V, Vdot_const, Vdot_u = clf_terms(ego_state, ego_vp, clfp, goal_point)
     constraints += [Vdot_const + Vdot_u @ u <= -clfp.clf_rate * V + s_clf[0]]
 
     Dt = sim.Dt
     lambda_cbf = cbfp.lambda_cbf
+    cbf_gain = eta if use_attcbf else lambda_cbf
     cbf_index = 0
+
+    def cbf_slack_term(index: int):
+        return s_cbf[index] if use_cbf_slack else 0.0
 
     # Pairwise inter-vehicle constraints against every other vehicle.
     for other_state, other_vp in zip(other_states, other_vps):
@@ -575,8 +592,8 @@ def solve_vehicle_qp(
                 constraints += [
                     0.5 * Dt**2 * (0.5 * hddot_const + hddot_u @ u)
                     + 0.5 * Dt * h_dot
-                    + 0.5 * lambda_cbf * h
-                    + s_cbf[cbf_index] >= 0.0
+                    + 0.5 * cbf_gain * h
+                    + cbf_slack_term(cbf_index) >= 0.0
                 ]
                 cbf_index += 1
 
@@ -596,52 +613,90 @@ def solve_vehicle_qp(
             constraints += [
                 0.5 * Dt**2 * (hddot_const + hddot_u @ u)
                 + Dt * h_dot
-                + lambda_cbf * h
-                + s_cbf[cbf_index] >= 0.0
+                + cbf_gain * h
+                + cbf_slack_term(cbf_index) >= 0.0
             ]
             cbf_index += 1
 
     assert cbf_index == n_cbf
 
-    objective = cp.Minimize(
+    objective_terms = (
         0.5 * cp.quad_form(u - u_nom, qpw.u_weight)
         + clfp.clf_slack_weight * cp.sum_squares(s_clf)
-        + cbfp.cbf_slack_weight * cp.sum_squares(s_cbf)
     )
+    if use_cbf_slack:
+        objective_terms += cbfp.cbf_slack_weight * cp.sum_squares(s_cbf)
+    if use_attcbf:
+        objective_terms += qpw.eta_weight * cp.square(eta)
+
+    objective = cp.Minimize(objective_terms)
 
     prob = cp.Problem(objective, constraints)
 
     qp_info = {
         "status": None,
+        "solver": None,
+        "solver_attempts": [],
         "u_nom": u_nom.copy(),
         "clf_V": V,
         "fallback": False,
+        "eta": None,
     }
 
-    solver_exception = None
+    optimal_statuses = {"optimal", "optimal_inaccurate"}
+    solver_attempts = []
+    solver_plan = [
+        ("OSQP", {
+            "solver": cp.OSQP,
+            "warm_start": True,
+            "verbose": False,
+            "eps_abs": 1e-5,
+            "eps_rel": 1e-5,
+            "max_iter": 20000,
+        }),
+        ("CLARABEL", {
+            "solver": "CLARABEL",
+            "warm_start": True,
+            "verbose": False,
+        }),
+        ("SCS", {
+            "solver": cp.SCS,
+            "warm_start": True,
+            "verbose": False,
+        }),
+    ]
 
-    try:
-        prob.solve(
-            solver=cp.OSQP,
-            warm_start=True,
-            verbose=False,
-            eps_abs=1e-5,
-            eps_rel=1e-5,
-            max_iter=20000,
-        )
-    except Exception:
+    for solver_name, solve_kwargs in solver_plan:
         try:
-            prob.solve(warm_start=True, verbose=False)
+            prob.solve(**solve_kwargs)
+            solver_attempts.append({"solver": solver_name, "status": prob.status})
+        except cp.SolverError as exc:
+            solver_attempts.append({
+                "solver": solver_name,
+                "status": f"exception:{type(exc).__name__}",
+                "exception": str(exc),
+            })
+            continue
         except Exception as exc:
-            solver_exception = exc
-            pass
+            solver_attempts.append({
+                "solver": solver_name,
+                "status": f"exception:{type(exc).__name__}",
+                "exception": str(exc),
+            })
+            continue
+
+        if prob.status in optimal_statuses:
+            qp_info["solver"] = solver_name
+            break
 
     qp_info["status"] = prob.status
-    if qp_info["status"] is None and solver_exception is not None:
-        qp_info["status"] = f"exception:{type(solver_exception).__name__}"
-        qp_info["exception"] = str(solver_exception)
+    qp_info["solver_attempts"] = solver_attempts
+    if qp_info["status"] is None and solver_attempts:
+        qp_info["status"] = solver_attempts[-1]["status"]
+        if "exception" in solver_attempts[-1]:
+            qp_info["exception"] = solver_attempts[-1]["exception"]
 
-    if u.value is None or prob.status not in ["optimal", "optimal_inaccurate"]:
+    if u.value is None or prob.status not in optimal_statuses:
         u_sol = np.array([
             np.clip(u_nom[0], ego_vp.min_accel, ego_vp.max_accel),
             np.clip(u_nom[1], ego_vp.min_steer_rate, ego_vp.max_steer_rate),
@@ -649,6 +704,8 @@ def solve_vehicle_qp(
         qp_info["fallback"] = True
     else:
         u_sol = np.array(u.value).reshape(2)
+        if use_attcbf and eta.value is not None:
+            qp_info["eta"] = float(np.clip(float(eta.value), qpw.eta_min, qpw.eta_max))
 
     return u_sol, qp_info
 
@@ -799,6 +856,7 @@ def run_single_rollout(
     init_states: Dict[str, np.ndarray],
     cbfp_schedule: str = "constant_same",
     goal_x: float = 5.0,
+    eta_weight_override: float = None,
 ):
     sim = SimParams(dt=0.1, T=10.0)
     geom = MergeGeometry()
@@ -808,16 +866,20 @@ def run_single_rollout(
     vps = {name: VehicleParams() for name in names}
     clfps = {name: CLFParams() for name in names}
     qpws = {name: QPWeights() for name in names}
+    if eta_weight_override is not None:
+        for qpw in qpws.values():
+            qpw.eta_weight = float(eta_weight_override)
 
-    lambda_constant_aggresive = 0.4
-    lambda_constant_normal = 0.2
+    lambda_constant_aggresive = 0.285
+    lambda_constant_normal = 0.107
     lambda_constant_conservative = 0.1
 
-    aggresive_gain = 0.4
-    conservative_gain = 0.2 / 4
+    aggresive_gain = 0.37
+    normal_gain = 0.09
+    conservative_gain = 0.03
 
 
-    clearance_gains = {"upper": conservative_gain, "mid": aggresive_gain, "lower": conservative_gain}
+    clearance_gains = {"upper": conservative_gain, "mid": normal_gain, "lower": aggresive_gain}
     lambda_lower = {name: 0.1 for name in names}
     lambda_upper = {name: 0.4 for name in names}
 
@@ -831,18 +893,19 @@ def run_single_rollout(
     clearance_mid_lower = current_clearances["mid_lower"]
 
     cbfps = {}
+    use_attcbf = cbfp_schedule == "attcbf"
     def adaptive_clearance_for_vehicle(name: str) -> float:
-        return clearance_mid_upper if (name == "upper" or name == "mid") else min(clearance_mid_lower, clearance_upper_lower)
+        #return clearance_mid_upper if (name == "upper" or name == "mid") else min(clearance_mid_lower, clearance_upper_lower)
         #return clearance_mid_lower if (name == "lower" or name == "mid") else min(clearance_mid_upper, clearance_upper_lower)
-        #return clearance_upper_lower if (name == "upper" or name == "lower") else min(clearance_mid_upper, clearance_mid_lower)
+        return clearance_upper_lower if (name == "upper" or name == "lower") else min(clearance_mid_upper, clearance_mid_lower)
 
     if cbfp_schedule == "constant_same":
         for name in names:
-            cbfps[name] = CBFParams(lambda_cbf=0.2, cbf_slack_weight=1e7)
+            cbfps[name] = CBFParams(lambda_cbf=0.102, cbf_slack_weight=1e8)
     elif cbfp_schedule == "constant_different":
-        cbfps["upper"] = CBFParams(lambda_cbf=lambda_constant_aggresive, cbf_slack_weight=1e7)
-        cbfps["mid"] = CBFParams(lambda_cbf=lambda_constant_conservative, cbf_slack_weight=1e7)
-        cbfps["lower"] = CBFParams(lambda_cbf=lambda_constant_normal, cbf_slack_weight=1e7)
+        cbfps["upper"] = CBFParams(lambda_cbf=lambda_constant_aggresive, cbf_slack_weight=1e8)
+        cbfps["mid"] = CBFParams(lambda_cbf=lambda_constant_conservative, cbf_slack_weight=1e8)
+        cbfps["lower"] = CBFParams(lambda_cbf=lambda_constant_normal, cbf_slack_weight=1e8)
     elif cbfp_schedule == "adaptive":
         for name in names:
             cbfps[name] = CBFParams(
@@ -852,19 +915,30 @@ def run_single_rollout(
                     lambda_lower_bound=lambda_lower[name],
                     lambda_upper_bound=lambda_upper[name],
                 ),
-                cbf_slack_weight=1e7,
+                cbf_slack_weight=1e8,
             )
+    elif cbfp_schedule == "attcbf":
+        for name in names:
+            cbfps[name] = CBFParams(lambda_cbf=0.0, cbf_slack_weight=1e8)
     else:
         raise ValueError("Unknown cbfp_schedule.")
 
-    hist = {"t": [0.0], "x_switch": geom.x_switch, "events": []}
+    attcbf_etas = {name: qpws[name].eta_min for name in names}
+    cbf_gain_label = "eta" if use_attcbf else "lambda"
+
+    hist = {
+        "t": [0.0],
+        "x_switch": geom.x_switch,
+        "events": [],
+        "cbf_gain_label": cbf_gain_label,
+    }
     for name in names:
         hist[f"x_{name}"] = [states[name].copy()]
         hist[f"u_{name}"] = []
         hist[f"qp_{name}"] = []
         hist[f"goal_{name}"] = []
         hist[f"epsi_{name}"] = []
-        hist[f"lambda_{name}"] = [cbfps[name].lambda_cbf]
+        hist[f"lambda_{name}"] = [attcbf_etas[name] if use_attcbf else cbfps[name].lambda_cbf]
     for pair_name, clearance in current_clearances.items():
         hist[f"clearance_{pair_name}"] = [clearance]
 
@@ -880,6 +954,19 @@ def run_single_rollout(
                 return "before_switch/angled"
             return "after_switch/middle"
 
+        if use_attcbf:
+            gain_msg = (
+                f"eta_u = {attcbf_etas['upper']:.3f} | "
+                f"eta_m = {attcbf_etas['mid']:.3f} | "
+                f"eta_l = {attcbf_etas['lower']:.3f}"
+            )
+        else:
+            gain_msg = (
+                f"lam_u = {cbfps['upper'].lambda_cbf:.3f} | "
+                f"lam_m = {cbfps['mid'].lambda_cbf:.3f} | "
+                f"lam_l = {cbfps['lower'].lambda_cbf:.3f}"
+            )
+
         msg = (
             f"t = {t_now:.1f} s | "
             #f"upper_left = {boundary_phase_label('upper', 'left')} | "
@@ -890,9 +977,7 @@ def run_single_rollout(
             #f"bclr_u = {boundary_clearances['upper']:.3f} | "
             #f"bclr_m = {boundary_clearances['mid']:.3f} | "
             #f"bclr_l = {boundary_clearances['lower']:.3f} | "
-            f"lam_u = {cbfps['upper'].lambda_cbf:.3f} | "
-            f"lam_m = {cbfps['mid'].lambda_cbf:.3f} | "
-            f"lam_l = {cbfps['lower'].lambda_cbf:.3f}"
+            f"{gain_msg}"
         )
         print(msg, flush=True)
 
@@ -950,6 +1035,7 @@ def run_single_rollout(
                     circle_offsets=circle_offsets,
                     circle_radius=circle_radius,
                     goal_point=goals[name],
+                    use_attcbf=use_attcbf,
                 )
             except Exception as exc:
                 u_nom = nominal_control(states[name], clfps[name], vps[name], goals[name])
@@ -963,7 +1049,14 @@ def run_single_rollout(
                     "clf_V": np.nan,
                     "fallback": True,
                     "exception": str(exc),
+                    "eta": None,
                 }
+
+        if use_attcbf:
+            for name in names:
+                eta_value = qp_infos[name].get("eta")
+                if eta_value is not None:
+                    attcbf_etas[name] = eta_value
 
         infeasible_names = [
             name for name in names
@@ -983,7 +1076,7 @@ def run_single_rollout(
                 hist[f"u_{name}"].append(controls[name].copy())
                 hist[f"qp_{name}"].append(qp_infos[name])
                 hist[f"goal_{name}"].append(goals[name].copy())
-                hist[f"lambda_{name}"].append(cbfps[name].lambda_cbf)
+                hist[f"lambda_{name}"].append(attcbf_etas[name] if use_attcbf else cbfps[name].lambda_cbf)
             for pair_name, clearance in current_clearances.items():
                 hist[f"clearance_{pair_name}"].append(clearance)
             hist["events"].append("infeasible_qp")
@@ -1022,7 +1115,7 @@ def run_single_rollout(
             hist[f"u_{name}"].append(controls[name].copy())
             hist[f"qp_{name}"].append(qp_infos[name])
             hist[f"goal_{name}"].append(goals[name].copy())
-            hist[f"lambda_{name}"].append(cbfps[name].lambda_cbf)
+            hist[f"lambda_{name}"].append(attcbf_etas[name] if use_attcbf else cbfps[name].lambda_cbf)
         for pair_name, clearance in next_clearances.items():
             hist[f"clearance_{pair_name}"].append(clearance)
         hist["events"].append(event)
@@ -1118,7 +1211,7 @@ def compute_rollout_metrics(
                     metrics[name_i]["intervehicle_collision"] = 1
             metrics[name_i]["min_intervehicle_clearance"] = min(metrics[name_i]["min_intervehicle_clearance"], min(clears))
 
-    deadlock = int(all(deadlock_flags[name] == 1 for name in names))
+    deadlock = int(any(deadlock_flags[name] == 1 for name in names))
     invalid_motion_metrics = infeasible_qp or any(
         metrics[name]["intervehicle_collision"] or metrics[name]["boundary_collision"]
         for name in names
@@ -1131,6 +1224,7 @@ def compute_rollout_metrics(
         "deadlock": deadlock,
         "infeasible_qp": infeasible_qp,
         "valid_motion_metrics": int(not invalid_motion_metrics),
+        "episode_return": float(np.sum(hist["reward"])) if "reward" in hist else float("nan"),
     }
 
 
@@ -1170,7 +1264,10 @@ def build_random_initial_states(cfg: RolloutConfig, geom: MergeGeometry):
     return states
 
 
-def run_monte_carlo(cbfp_schedule: str = "constant_normal", n_rollouts: int = 10):
+def run_monte_carlo(
+    cbfp_schedule: str = "constant_normal",
+    n_rollouts: int = 10,
+):
     geom = MergeGeometry()
     rollout_cfg = RolloutConfig(n_rollouts=n_rollouts)
     initial_states = build_random_initial_states(rollout_cfg, geom)
@@ -1202,8 +1299,12 @@ def run_monte_carlo(cbfp_schedule: str = "constant_normal", n_rollouts: int = 10
 
 
 def average_rollout_metrics(all_metrics: List[Dict]) -> Dict:
-    avg = {name: {} for name in ["upper", "mid", "lower"]}
+    names = ["upper", "mid", "lower"]
+    n_vehicles = len(names)
+    n_rollouts = len(all_metrics)
+    avg = {name: {} for name in names}
     valid_motion_metrics = [m for m in all_metrics if m.get("valid_motion_metrics", 1)]
+    completion_metrics = [m for m in valid_motion_metrics if not m.get("deadlock", 0)]
 
     def mean_valid(name: str, key: str, nanmean: bool = False) -> float:
         if not valid_motion_metrics:
@@ -1216,7 +1317,28 @@ def average_rollout_metrics(all_metrics: List[Dict]) -> Dict:
             return float(np.mean(finite_values))
         return float(np.mean(values))
 
-    for name in ["upper", "mid", "lower"]:
+    def rollout_system_completion_time(m: Dict) -> float:
+        times = np.array([m[name]["time_to_goal"] for name in names], dtype=float)
+        if np.any(np.isnan(times)):
+            return float("nan")
+        return float(np.max(times))
+
+    def mean_valid_system(metric_fn) -> float:
+        if not valid_motion_metrics:
+            return float("nan")
+        values = [metric_fn(m) for m in valid_motion_metrics]
+        return float(np.mean(values))
+
+    def mean_system_completion_time() -> float:
+        if not completion_metrics:
+            return float("nan")
+        values = [rollout_system_completion_time(m) for m in completion_metrics]
+        finite_values = [v for v in values if not np.isnan(v)]
+        if not finite_values:
+            return float("nan")
+        return float(np.mean(finite_values))
+
+    for name in names:
         avg[name]["time_to_goal"] = mean_valid(name, "time_to_goal", nanmean=True)
         avg[name]["goal_reached_count"] = int(np.sum([m[name]["goal_reached"] for m in valid_motion_metrics]))
         avg[name]["avg_abs_y"] = mean_valid(name, "avg_abs_y")
@@ -1227,15 +1349,80 @@ def average_rollout_metrics(all_metrics: List[Dict]) -> Dict:
         avg[name]["min_intervehicle_clearance"] = mean_valid(name, "min_intervehicle_clearance")
         avg[name]["min_boundary_clearance"] = mean_valid(name, "min_boundary_clearance")
 
-    avg["deadlock_count"] = int(np.sum([m["deadlock"] for m in all_metrics]))
+    deadlock_count = int(np.sum([m["deadlock"] for m in valid_motion_metrics]))
+    avg["deadlock_count"] = deadlock_count
     avg["deadlock_rate"] = (
-        float(np.mean([m["deadlock"] for m in valid_motion_metrics]))
-        if valid_motion_metrics
+        100.0 * deadlock_count / n_rollouts
+        if n_rollouts
         else float("nan")
     )
     avg["infeasible_qp_count"] = int(np.sum([m["infeasible_qp"] for m in all_metrics]))
     avg["infeasible_qp_rate"] = float(np.mean([m["infeasible_qp"] for m in all_metrics]))
     avg["valid_motion_rollouts"] = len(valid_motion_metrics)
+    avg["valid_motion_rollout_rate"] = (
+        100.0 * avg["valid_motion_rollouts"] / n_rollouts
+        if n_rollouts
+        else float("nan")
+    )
+    avg["intervehicle_collision_count"] = int(np.sum([
+        int(any(m[name]["intervehicle_collision"] for name in names))
+        for m in all_metrics
+    ]))
+    avg["intervehicle_collision_rate"] = (
+        100.0 * avg["intervehicle_collision_count"] / n_rollouts
+        if n_rollouts
+        else float("nan")
+    )
+    avg["boundary_collision_count"] = int(np.sum([
+        int(any(m[name]["boundary_collision"] for name in names))
+        for m in all_metrics
+    ]))
+    avg["boundary_collision_rate"] = (
+        100.0 * avg["boundary_collision_count"] / n_rollouts
+        if n_rollouts
+        else float("nan")
+    )
+    avg["collision_count"] = int(np.sum([
+        int(
+            any(m[name]["intervehicle_collision"] or m[name]["boundary_collision"] for name in names)
+        )
+        for m in all_metrics
+    ]))
+    avg["collision_rate"] = (
+        100.0 * avg["collision_count"] / n_rollouts
+        if n_rollouts
+        else float("nan")
+    )
+    episode_returns = [
+        m["episode_return"]
+        for m in valid_motion_metrics
+        if "episode_return" in m and not np.isnan(m["episode_return"])
+    ]
+    avg["avg_episode_return"] = (
+        float(np.mean(episode_returns))
+        if episode_returns
+        else float("nan")
+    )
+    avg["system"] = {
+        "valid_rollouts": avg["valid_motion_rollouts"],
+        "valid_rollout_rate": avg["valid_motion_rollout_rate"],
+        "deadlock_count": avg["deadlock_count"],
+        "deadlock_rate": avg["deadlock_rate"],
+        "intervehicle_collision_rate": avg["intervehicle_collision_rate"],
+        "boundary_collision_rate": avg["boundary_collision_rate"],
+        "collision_count": avg["collision_count"],
+        "collision_rate": avg["collision_rate"],
+        "completion_time": mean_system_completion_time(),
+        "acc_effort": mean_valid_system(
+            lambda m: sum(m[name]["acc_effort"] for name in names)
+        ),
+        "steer_rate_effort": mean_valid_system(
+            lambda m: sum(m[name]["steer_rate_effort"] for name in names)
+        ),
+        "centerline_deviation": mean_valid_system(
+            lambda m: sum(m[name]["avg_abs_y"] for name in names) / n_vehicles
+        ),
+    }
     return avg
 
 
@@ -1247,67 +1434,45 @@ def show_average_metrics_table(avg_metrics, n_rollouts: int):
     def fmt_nan(x):
         return "NaN" if np.isnan(x) else f"{x:.3f}"
 
+    def fmt_percent(x):
+        return "NaN" if np.isnan(x) else f"{x:.1f}%"
+
+    system = avg_metrics["system"]
     row_labels = [
-        "Time to Goal [s]",
-        "Goal Reached [count]",
-        "Avg |y|",
-        "Acceleration Effort",
-        "Steering-Rate Effort",
-        "Inter-Vehicle Collision Rate",
-        "Boundary Collision Rate",
-        "Min Inter-Vehicle Clearance [m]",
-        "Min Boundary Clearance [m]",
+        "Task Completion Time [s]",
+        "Collision Rate",
         "Deadlock Rate",
-        "Infeasible QP [count]",
-        "Infeasible QP Rate",
-        "Valid Motion Rollouts",
     ]
-
-    deadlock_rate_str = fmt_nan(avg_metrics["deadlock_rate"])
-    infeasible_count_str = f"{avg_metrics['infeasible_qp_count']}/{n_rollouts}"
-    infeasible_rate_str = f"{avg_metrics['infeasible_qp_rate']:.3f}"
-    valid_motion_rollouts_str = f"{avg_metrics['valid_motion_rollouts']}/{n_rollouts}"
-
     table_data = [
-        [fmt_nan(avg_metrics["upper"]["time_to_goal"]), fmt_nan(avg_metrics["mid"]["time_to_goal"]), fmt_nan(avg_metrics["lower"]["time_to_goal"])],
-        [f"{avg_metrics['upper']['goal_reached_count']}/{n_rollouts}", f"{avg_metrics['mid']['goal_reached_count']}/{n_rollouts}", f"{avg_metrics['lower']['goal_reached_count']}/{n_rollouts}"],
-        [f"{avg_metrics['upper']['avg_abs_y']:.3f}", f"{avg_metrics['mid']['avg_abs_y']:.3f}", f"{avg_metrics['lower']['avg_abs_y']:.3f}"],
-        [f"{avg_metrics['upper']['acc_effort']:.3f}", f"{avg_metrics['mid']['acc_effort']:.3f}", f"{avg_metrics['lower']['acc_effort']:.3f}"],
-        [f"{avg_metrics['upper']['steer_rate_effort']:.3f}", f"{avg_metrics['mid']['steer_rate_effort']:.3f}", f"{avg_metrics['lower']['steer_rate_effort']:.3f}"],
-        [f"{avg_metrics['upper']['intervehicle_collision']:.3f}", f"{avg_metrics['mid']['intervehicle_collision']:.3f}", f"{avg_metrics['lower']['intervehicle_collision']:.3f}"],
-        [f"{avg_metrics['upper']['boundary_collision']:.3f}", f"{avg_metrics['mid']['boundary_collision']:.3f}", f"{avg_metrics['lower']['boundary_collision']:.3f}"],
-        [f"{avg_metrics['upper']['min_intervehicle_clearance']:.3f}", f"{avg_metrics['mid']['min_intervehicle_clearance']:.3f}", f"{avg_metrics['lower']['min_intervehicle_clearance']:.3f}"],
-        [f"{avg_metrics['upper']['min_boundary_clearance']:.3f}", f"{avg_metrics['mid']['min_boundary_clearance']:.3f}", f"{avg_metrics['lower']['min_boundary_clearance']:.3f}"],
-        [deadlock_rate_str, deadlock_rate_str, deadlock_rate_str],
-        [infeasible_count_str, infeasible_count_str, infeasible_count_str],
-        [infeasible_rate_str, infeasible_rate_str, infeasible_rate_str],
-        [valid_motion_rollouts_str, valid_motion_rollouts_str, valid_motion_rollouts_str],
+        [fmt_nan(system["completion_time"])],
+        [f"{avg_metrics['collision_count']}/{n_rollouts} ({fmt_percent(avg_metrics['collision_rate'])})"],
+        [f"{system['deadlock_count']}/{n_rollouts} ({fmt_percent(system['deadlock_rate'])})"],
     ]
 
-    fig, ax = plt.subplots(figsize=(12, 7.2))
+    fig, ax = plt.subplots(figsize=(6.5, 2.6))
     ax.axis("off")
-    ax.set_title(f"Average Metrics Summary over {n_rollouts} Rollouts", fontsize=13, pad=12)
+    ax.set_title(f"Metrics Summary over {n_rollouts} Rollouts", fontsize=13, pad=10)
 
     table = ax.table(
         cellText=table_data,
         rowLabels=row_labels,
-        colLabels=["Upper Vehicle", "Middle Vehicle", "Lower Vehicle"],
+        colLabels=["Process"],
         cellLoc="center",
         rowLoc="center",
         loc="center",
-        bbox=[0.05, 0.02, 0.90, 0.92],
+        bbox=[0.15, 0.05, 0.80, 0.78],
     )
 
     table.auto_set_font_size(False)
-    table.set_fontsize(10)
+    table.set_fontsize(10.5)
 
     for (row, col), cell in table.get_celld().items():
         cell.set_linewidth(0.8)
         if row == 0:
             cell.set_text_props(weight="bold")
-            cell.set_height(0.085)
+            cell.set_height(0.20)
         else:
-            cell.set_height(0.088)
+            cell.set_height(0.20)
         if col == -1:
             cell.set_text_props(weight="bold")
 
@@ -1392,12 +1557,13 @@ def plot_results(hist, geom: MergeGeometry, filename: str = "three_vehicle_merge
     axs[2, 1].grid(True)
     axs[2, 1].legend()
 
-    axs[3, 0].plot(t_state, hist["lambda_upper"], label="lambda_upper")
-    axs[3, 0].plot(t_state, hist["lambda_mid"], label="lambda_mid")
-    axs[3, 0].plot(t_state, hist["lambda_lower"], label="lambda_lower")
-    axs[3, 0].set_title("CBF Lambda")
+    cbf_gain_label = hist.get("cbf_gain_label", "lambda")
+    axs[3, 0].plot(t_state, hist["lambda_upper"], label=f"{cbf_gain_label}_upper")
+    axs[3, 0].plot(t_state, hist["lambda_mid"], label=f"{cbf_gain_label}_mid")
+    axs[3, 0].plot(t_state, hist["lambda_lower"], label=f"{cbf_gain_label}_lower")
+    axs[3, 0].set_title("CBF Gain")
     axs[3, 0].set_xlabel("t [s]")
-    axs[3, 0].set_ylabel("lambda_cbf")
+    axs[3, 0].set_ylabel(cbf_gain_label)
     axs[3, 0].grid(True)
     axs[3, 0].legend()
 
@@ -1450,6 +1616,7 @@ def animate_simulation(
     x_hist = {name: hist[f"x_{name}"] for name in names}
     goal_hist = {name: hist[f"goal_{name}"] for name in names}
     lambda_hist = {name: hist.get(f"lambda_{name}") for name in names}
+    cbf_gain_label = hist.get("cbf_gain_label", "lambda")
     t = hist["t"]
 
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -1587,7 +1754,7 @@ def animate_simulation(
         artists.append(time_text)
         for name in names:
             if lambda_hist[name] is not None and len(lambda_hist[name]) > 0:
-                lambda_texts[name].set_text(f"lambda_{name} = {lambda_hist[name][0]:.3f}")
+                lambda_texts[name].set_text(f"{cbf_gain_label}_{name} = {lambda_hist[name][0]:.3f}")
             artists.append(lambda_texts[name])
         return artists
 
@@ -1624,7 +1791,7 @@ def animate_simulation(
         for name in names:
             if lambda_hist[name] is not None and len(lambda_hist[name]) > 0:
                 lambda_idx = min(frame, len(lambda_hist[name]) - 1)
-                lambda_texts[name].set_text(f"lambda_{name} = {lambda_hist[name][lambda_idx]:.3f}")
+                lambda_texts[name].set_text(f"{cbf_gain_label}_{name} = {lambda_hist[name][lambda_idx]:.3f}")
             artists.append(lambda_texts[name])
         return artists
 
@@ -1660,30 +1827,32 @@ def animate_simulation(
 
 if __name__ == "__main__":
     print("Select lambda_cbf baseline method:")
-    print("  1. Constant, normal value (0.2) for all vehicles")
-    print("  2. Constant, normal value (0.2) for upper/mid and conservative value (0.15) for lower")
-    print("  3. Distance-adaptive values for all vehicles")
-    choice = input("Enter 1, 2, or 3 [default: 1]: ").strip()
+    print("  1. Fixed Uniform Assignment")
+    print("  2. Fixed Heterogeneous Assignment")
+    print("  3. Heuristic Assignment")
+    print("  4. aTTCBF Adaptive QP Gain")
+    choice = input("Enter 1, 2, 3, or 4 [default: 1]: ").strip()
 
     schedule_map = {
         "1": "constant_same",
         "2": "constant_different",
         "3": "adaptive",
+        "4": "attcbf",
     }
     cbfp_schedule = schedule_map.get(choice, "constant_same")
     choice_tag = choice if choice in schedule_map else "1"
 
     if cbfp_schedule == "constant_same":
-        print("All vehicles will use constant lambda_cbf = 0.2")
+        print("Fixed Uniform Assignment will be used.")
     elif cbfp_schedule == "constant_different":
-        print("Middle will use constant lambda_cbf = 0.4, upper will use constant lambda_cbf = 0.2, lower will use constant lambda_cbf = 0.1")
+        print("Fixed Heterogeneous Assignment will be used.")
+    elif cbfp_schedule == "adaptive":
+        print("Heuristic Assignment will be used.")
     else:
-        print("All vehicles will use distance-adaptive lambda_cbf values")
-        print("Rule: lambda_cbf = clip(clearance_gain * min_intervehicle_clearance, lambda_min, lambda_max)")
+        print("aTTCBF Adaptive QP Gain will be used.")
 
     n_rollouts = 20
 
-    figure_filename = f"three_vehicle_merge_results_choice{choice_tag}.png"
     video_filename = f"three_vehicle_merge_choice{choice_tag}.mp4"
 
     avg_metrics, last_hist, last_bundle = run_monte_carlo(
@@ -1694,8 +1863,6 @@ if __name__ == "__main__":
     show_average_metrics_table(avg_metrics, n_rollouts=n_rollouts)
 
     sim, vps, geom, circle_offsets, circle_radius = last_bundle
-    plot_results(last_hist, geom, filename=figure_filename)
-
     animate_simulation(
         last_hist,
         vps,
